@@ -1,335 +1,755 @@
 #!/usr/bin/env python3
-import os
-import logging
 import re
+import json
+import logging
+import os
+import psycopg2
+import threading
+import asyncio
 from datetime import datetime, timedelta
 
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram import Update, ChatPermissions
+from telegram.constants import ParseMode, ChatType
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    ChatMemberHandler,
+    ContextTypes,
+    filters,
+)
 
-# Настройка логирования с выводом в консоль
+# ========= Конфигурация =========
+TOKEN = "7501357038:AAFAonBpoHeZ2GxmOr7noPtP7VYMbehfmkE"
+# Если используются супергруппы, ID обычно имеют вид -100XXXXXXXXXX
+FRONTEND_CHAT_ID = -1002609344415  # Чат пользователей
+ADMIN_GROUP_ID = -1002609344415     # Группа "Frontend администрация"
+BOT_THREAD_ID = 98                 # ID темы для команд (тема "bot")
+LOGS_THREAD_ID = 88                # ID темы для логов (тема "logs")
+DATABASE_URL = "postgresql://frontendtgbot_db_admin:1509@localhost/frontendtgbot_db"
+SCHEMA = "my_schema"
+
+# ========= Настройка логирования =========
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# Получение токена (лучше хранить его в переменной окружения)
-TOKEN = "7501357038:AAFAonBpoHeZ2GxmOr7noPtP7VYMbehfmkE"
-if not TOKEN:
-    logger.error("Не найден токен бота. Установите переменную окружения BOT_TOKEN.")
-    exit(1)
+# ========= Работа с базой данных (PostgreSQL) =========
+def init_db_postgres():
+    """Создаёт схему (если её нет) и таблицу для хранения информации о пользователях."""
+    try:
+        with psycopg2.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"CREATE SCHEMA IF NOT EXISTS {SCHEMA} AUTHORIZATION frontendtgbot_db_admin;"
+                )
+                cur.execute(
+                    f'''
+                    CREATE TABLE IF NOT EXISTS {SCHEMA}.users (
+                        user_id BIGINT PRIMARY KEY,
+                        join_date TIMESTAMP,
+                        alias TEXT,
+                        warns INTEGER DEFAULT 0,
+                        bans INTEGER DEFAULT 0,
+                        history JSONB
+                    );
+                    '''
+                )
+                conn.commit()
+        logger.info("Схема и таблица успешно созданы или уже существуют.")
+    except Exception as e:
+        logger.error("Ошибка инициализации БД: %s", e)
 
-# ------------------------- Регулярные выражения для правил -------------------------
 
-# 3.6, 3.7: Запрещённая лексика (открытый мат и его завуалированные варианты)
-BANNED_WORDS = [
-    'хуй', 'пизда', 'сука', 'блядь', 'дибил', 'гандон', 'еблан',
-    'ебать', 'ебал', 'бля', 'блядёшка', 'блядоёбина', 'блядоёбина хуеротая'
-]
-BANNED_PATTERN = re.compile(r'\b(' + '|'.join(BANNED_WORDS) + r')\b', re.IGNORECASE)
+def get_user(user_id: int):
+    try:
+        with psycopg2.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT user_id, join_date, alias, warns, bans, history "
+                    f"FROM {SCHEMA}.users WHERE user_id = %s;",
+                    (user_id,),
+                )
+                row = cur.fetchone()
+                if row:
+                    history = row[5]
+                    if isinstance(history, str):
+                        try:
+                            history = json.loads(history)
+                        except Exception:
+                            history = []
+                    return {
+                        "user_id": row[0],
+                        "join_date": row[1],
+                        "alias": row[2],
+                        "warns": row[3],
+                        "bans": row[4],
+                        "history": history if history else [],
+                    }
+    except Exception as e:
+        logger.error("Ошибка в get_user: %s", e)
+    return None
 
-# 3.17: Обнаружение ссылок
-LINK_PATTERN = re.compile(
-    r'((http|https)://)?'     # протокол (опционально)
-    r'([\w.-]+)'              # доменное имя или IP
-    r'(\.[a-zA-Z]{2,})'        # TLD
-    r'([/\w .-]*)*/*'          # путь
-)
 
-# Специфичные ключевые слова для спама/рекламы
-SPAM_KEYWORDS = ["зарабатывать", "сотрудничество", "120$", "новичков", "пишит"]
+def create_user(user_id: int, alias: str):
+    now = datetime.now()
+    try:
+        with psycopg2.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f'''
+                    INSERT INTO {SCHEMA}.users 
+                        (user_id, join_date, alias, warns, bans, history)
+                    VALUES (%s, %s, %s, 0, 0, %s)
+                    ON CONFLICT (user_id) DO NOTHING;
+                    ''',
+                    (user_id, now, alias, json.dumps([])),
+                )
+                conn.commit()
+    except Exception as e:
+        logger.error("Ошибка в create_user: %s", e)
 
-# 3.2-3.4: Пиратство, мошенничество и использование запрещённых программ
-FRAUD_PIRACY_PATTERN = re.compile(
-    r'\b(мошен(?:ничество)?|пират(?:ский|ство)?|запрещён(?:ные|ные)\s+программ[ы]?|кракер|чита(?:ть|ние)?|бесплатно\s+скачать)\b',
-    re.IGNORECASE
-)
 
-# 3.5: Выдача себя за представителя администрации
-SELF_ADMIN_PATTERN = re.compile(r'\b(я\s*(админ|модератор))\b', re.IGNORECASE)
+def update_user(user: dict):
+    try:
+        with psycopg2.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f'''
+                    UPDATE {SCHEMA}.users
+                    SET alias = %s, warns = %s, bans = %s, history = %s
+                    WHERE user_id = %s;
+                    ''',
+                    (
+                        user["alias"],
+                        user["warns"],
+                        user["bans"],
+                        json.dumps(user["history"]),
+                        user["user_id"],
+                    ),
+                )
+                conn.commit()
+    except Exception as e:
+        logger.error("Ошибка в update_user: %s", e)
 
-# 3.13: Пропаганда насилия, оружия, наркотиков, порнографии и т.п.
-DRUG_VIOLENCE_PATTERN = re.compile(
-    r'\b(наркотик(?:и)?|оружие|насилие|порнография|сексуальный\s+контент|алкоголь|табак)\b',
-    re.IGNORECASE
-)
 
-# 3.14: Клевета и распространение ложной информации
-DEFAMATION_PATTERN = re.compile(r'\b(клевет(?:а)?|ложная\s+информация|фейк)\b', re.IGNORECASE)
+def add_punishment(
+        user_id: int,
+        alias: str,
+        punishment_type: str,
+        reason: str,
+        duration: int,
+        issued_by: str,
+):
+    """
+    Добавляет наказание в историю пользователя.
+    punishment_type: "warn", "ban", "mute" и т.п.
+    duration: срок наказания (в днях для warn, в часах для ban, в минутах для mute)
+    issued_by: имя администратора или 'bot'
+    """
+    now = datetime.now()
+    punishment = {
+        "id": int(now.timestamp()),
+        "date": now.strftime("%Y-%m-%d %H:%M:%S"),
+        "type": punishment_type,
+        "reason": reason,
+        "duration": duration,
+        "issued_by": issued_by,
+    }
+    user_record = get_user(user_id)
+    if not user_record:
+        create_user(user_id, alias)
+        user_record = get_user(user_id)
+    if punishment_type == "warn":
+        user_record["warns"] += 1
+    elif punishment_type == "ban":
+        user_record["bans"] += 1
+    user_record["history"].append(punishment)
+    update_user(user_record)
+    return user_record
 
-# 3.10: Заявления о превосходстве одной нации/народа над другими
-SUPERIORITY_PATTERN = re.compile(r'\b(превосходство|лучше\s+всех|супремаси)\b', re.IGNORECASE)
 
-# 3.18: Троллинг и провокационные сообщения
-TROLLING_PATTERN = re.compile(r'\b(троллить|троллинг|провокация)\b', re.IGNORECASE)
+def remove_warn(user_id: int):
+    """Удаляет одно предупреждение из истории пользователя."""
+    user_record = get_user(user_id)
+    if not user_record or user_record["warns"] <= 0:
+        return None
+    user_record["warns"] -= 1
+    for i in range(len(user_record["history"]) - 1, -1, -1):
+        if user_record["history"][i].get("type") == "warn":
+            del user_record["history"][i]
+            break
+    update_user(user_record)
+    return user_record
 
-# 3.20: Разглашение личной информации (телефоны, email и т.п.)
-PERSONAL_INFO_PATTERN = re.compile(
-    r'\b(\+?\d[\d\s\-]{7,}\d|[\w\.-]+@[\w\.-]+\.\w+)\b'
-)
 
-# ------------------------- Вспомогательные функции -------------------------
+def cleanup_expired_warnings():
+    """Периодическая очистка устаревших предупреждений.
+    Пока функция является заглушкой и запускается каждые 3600 секунд.
+    """
+    logger.info("Запущена задача очистки устаревших предупреждений.")
+    threading.Timer(3600, cleanup_expired_warnings).start()
 
-def has_repeated_characters(text: str) -> bool:
-    """Проверяет, содержит ли сообщение более 3-х одинаковых символов подряд (флуд)."""
-    return bool(re.search(r'(.)\1{2,}', text))
 
-def contains_link(text: str) -> bool:
-    """Проверяет наличие ссылки в сообщении."""
-    return bool(LINK_PATTERN.search(text))
+# ========= Работа со списком запрещённых слов =========
+def load_banned_keywords():
+    try:
+        with open("banned_keywords.txt", "r", encoding="utf-8") as f:
+            keywords = [
+                line.strip() for line in f if line.strip() and not line.startswith("#")
+            ]
+        logger.info("Загружен список запрещённых слов.")
+        return keywords
+    except Exception as e:
+        logger.error("Ошибка загрузки banned_keywords.txt: %s", e)
+        return ["запрещенное_слово1", "запрещенное_слово2"]
 
-def is_mixed_alphabet_spam(text: str, threshold: float = 0.7) -> bool:
-    """Проверяет, доминируют ли в сообщении буквы не из кириллицы (признак спама)."""
-    letters = [c for c in text if c.isalpha()]
-    if not letters:
+
+BANNED_KEYWORDS = load_banned_keywords()
+
+
+def check_violation(text: str) -> bool:
+    text_lower = text.lower()
+    for word in BANNED_KEYWORDS:
+        pattern = r"\b" + re.escape(word.lower()) + r"\b"
+        if re.search(pattern, text_lower):
+            return True
+    return False
+
+
+# ========= Функция автоматического разбана =========
+async def schedule_unban(bot, user_id: int, duration: int):
+    """После истечения срока бана (в часах) автоматически разбанивает пользователя."""
+    await asyncio.sleep(duration * 3600)
+    try:
+        await bot.unban_chat_member(
+            chat_id=FRONTEND_CHAT_ID, user_id=user_id, only_if_banned=True
+        )
+        logger.info(f"Пользователь {user_id} автоматически разбанен после {duration} часов.")
+    except Exception as e:
+        logger.error("Ошибка автоматического разбана пользователя %s: %s", user_id, e)
+
+
+# ========= Функция запуска =========
+async def on_startup(app):
+    try:
+        await app.bot.send_message(
+            chat_id=FRONTEND_CHAT_ID,
+            text="Бот подключен в основной чат."
+        )
+        await app.bot.send_message(
+            chat_id=ADMIN_GROUP_ID,
+            message_thread_id=BOT_THREAD_ID,
+            text="Бот подключен в тему команд.",
+        )
+        await app.bot.send_message(
+            chat_id=ADMIN_GROUP_ID,
+            message_thread_id=LOGS_THREAD_ID,
+            text="Бот подключен в тему логов.",
+        )
+        logger.info("Сообщения о подключении успешно отправлены.")
+    except Exception as e:
+        logger.error("Ошибка отправки сообщений о подключении: %s", e)
+
+
+# ========= Проверка прав администратора =========
+async def is_admin_in_frontend(
+        user_id: int, context: ContextTypes.DEFAULT_TYPE
+) -> bool:
+    try:
+        admins = await context.bot.get_chat_administrators(FRONTEND_CHAT_ID)
+        admin_ids = {admin.user.id for admin in admins}
+        return user_id in admin_ids
+    except Exception as e:
+        logger.error("Ошибка при получении администраторов FRONTEND_CHAT_ID: %s", e)
         return False
-    cyrillic_count = sum(1 for c in letters if re.match(r'[А-Яа-яЁё]', c))
-    return (cyrillic_count / len(letters)) < threshold
 
-def log_deleted_message(message) -> None:
+
+async def is_valid_admin_command(
+        update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> bool:
     """
-    Записывает в файл 'logs.txt' информацию об удалённом сообщении:
-    @alias | Ник | дата | сообщение
-    Обёртка защищена от ошибок записи.
+    Команда действительна, если:
+      - сообщение отправлено в группе ADMIN_GROUP_ID,
+      - в теме с ID BOT_THREAD_ID,
+      - отправитель является администратором в FRONTEND_CHAT_ID.
     """
+    message = update.effective_message
+    if message.chat.id != ADMIN_GROUP_ID:
+        return False
+    if not message.message_thread_id or message.message_thread_id != BOT_THREAD_ID:
+        return False
+    return await is_admin_in_frontend(message.from_user.id, context)
+
+
+async def delete_command_message(update: Update):
     try:
-        user = message.from_user
-        username = "@" + (user.username if user.username else "unknown")
-        nickname = user.full_name if user.full_name else "unknown"
-        date_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        text = message.text
-        log_entry = f"{username} | {nickname} | {date_str} | {text}\n"
-        with open("logs.txt", "a", encoding="utf-8") as f:
-            f.write(log_entry)
+        await update.effective_message.delete()
     except Exception as e:
-        logger.error(f"Ошибка записи в лог-файл: {e}")
+        logger.error("Ошибка удаления командного сообщения: %s", e)
 
-async def delete_and_reply(message, reply_text: str) -> None:
+
+# ========= Обработчики сообщений =========
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Удаляет сообщение, логирует событие и отправляет уведомление отправителю.
-    Оборачивает операции в try/except для устойчивости.
+    При обнаружении нарушения бот удаляет сообщение, уведомляет пользователя,
+    выдаёт предупреждение и логирует событие.
     """
-    try:
-        await message.delete()
-        log_deleted_message(message)
-        await message.reply_text(reply_text)
-        logger.info(f"Сообщение от {message.from_user.id} удалено. Ответ: {reply_text}")
-    except Exception as e:
-        logger.error(f"Ошибка при удалении сообщения: {e}")
-
-# ------------------------- Основная функция проверки сообщения -------------------------
-
-async def check_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Обрабатываем только сообщения в группах/супергруппах
-    if update.effective_chat.type not in ['group', 'supergroup']:
-        return
-
-    message = update.message
+    message = update.effective_message
     if not message or not message.text:
         return
 
-    # Приводим текст к нижнему регистру для большинства проверок
-    text_original = message.text.strip()
-    text = text_original.lower()
+    if check_violation(message.text):
+        user_tag = (
+            f"@{message.from_user.username}"
+            if message.from_user.username
+            else message.from_user.first_name
+        )
+        violation_notice = f"{user_tag}, ваше сообщение нарушает правила чата."
+        try:
+            await message.delete()
+        except Exception as e:
+            logger.error("Ошибка удаления сообщения: %s", e)
+        try:
+            await context.bot.send_message(
+                chat_id=message.chat.id,
+                text=violation_notice,
+                parse_mode=ParseMode.HTML
+            )
+        except Exception as e:
+            logger.error("Ошибка отправки уведомления: %s", e)
+        user_record = add_punishment(
+            message.from_user.id, user_tag, "warn", "Нарушение правил", 3, "bot"
+        )
+        try:
+            await context.bot.send_message(
+                chat_id=message.from_user.id,
+                text=(
+                    f"Вы получили предупреждение. Всего предупреждений: "
+                    f"{user_record['warns']}."
+                ),
+            )
+        except Exception as e:
+            logger.error("Ошибка отправки личного сообщения: %s", e)
+        log_text = (
+            f"Автоматическое предупреждение: пользователь {user_tag} "
+            f"(ID: {message.from_user.id}) нарушил правила. Всего предупреждений: "
+            f"{user_record['warns']}."
+        )
+        await context.bot.send_message(
+            chat_id=ADMIN_GROUP_ID,
+            message_thread_id=LOGS_THREAD_ID,
+            text=log_text,
+        )
 
-    # 3.1. Обсуждение правил чата
-    if re.search(r'\b(правил(?:а|ы)?\s+чата)\b', text):
-        await delete_and_reply(message, "Обсуждение правил чата запрещено.")
+
+# ========= Команды для администраторов =========
+async def ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /ban user_id причина срок(в часах)
+    Выдаёт бан пользователю в FRONTEND_CHAT_ID, фиксирует наказание и
+    автоматически снимает бан по истечении срока.
+    """
+    if not await is_valid_admin_command(update, context):
+        return
+    args = context.args
+    if len(args) < 3:
+        await update.effective_message.reply_text(
+            "Использование: /ban user_id причина срок(в часах)"
+        )
+        await delete_command_message(update)
         return
 
-    # 3.2-3.4. Мошенничество, пиратство, использование запрещённых программ
-    if FRAUD_PIRACY_PATTERN.search(text):
-        await delete_and_reply(message, "Обсуждение мошенничества или пиратских ресурсов запрещено.")
+    target_alias = args[0].lstrip("@")
+    try:
+        duration = int(args[-1])
+    except ValueError:
+        await update.effective_message.reply_text(
+            "Срок должен быть числом (в часах)."
+        )
+        await delete_command_message(update)
+        return
+    reason = " ".join(args[1:-1])
+    try:
+        target_user_id = int(target_alias)
+    except ValueError:
+        await update.effective_message.reply_text(
+            "Ошибка: для /ban необходимо указывать числовой user_id."
+        )
+        await delete_command_message(update)
+        return
+    try:
+        await context.bot.ban_chat_member(
+            chat_id=FRONTEND_CHAT_ID, user_id=target_user_id
+        )
+        user_record = add_punishment(
+            target_user_id,
+            target_alias,
+            "ban",
+            reason,
+            duration,
+            update.effective_message.from_user.first_name,
+        )
+        await update.effective_message.reply_text(
+            f"Пользователь {target_alias} забанен на {duration} часов. "
+            f"Всего банов: {user_record['bans']}."
+        )
+        log_text = (
+            f"БАН: Админ {update.effective_message.from_user.first_name} "
+            f"(ID: {update.effective_message.from_user.id}) забанил пользователя {target_alias} "
+            f"на {duration} часов. Причина: {reason}. Всего банов: {user_record['bans']}."
+        )
+        await context.bot.send_message(
+            chat_id=ADMIN_GROUP_ID,
+            message_thread_id=LOGS_THREAD_ID,
+            text=log_text,
+        )
+        asyncio.create_task(schedule_unban(context.bot, target_user_id, duration))
+    except Exception as e:
+        await update.effective_message.reply_text(
+            "Ошибка при выполнении команды /ban."
+        )
+        logger.error("Ошибка в /ban: %s", e)
+    await delete_command_message(update)
+
+
+async def warn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /warn user_id причина срок(в днях)
+    Выдаёт предупреждение пользователю.
+    """
+    if not await is_valid_admin_command(update, context):
+        return
+    args = context.args
+    if len(args) < 3:
+        await update.effective_message.reply_text(
+            "Использование: /warn user_id причина срок(в днях)"
+        )
+        await delete_command_message(update)
         return
 
-    # 3.5. Выдача себя за представителя администрации
-    if SELF_ADMIN_PATTERN.search(text):
-        await delete_and_reply(message, "Выдача себя за представителя администрации запрещена.")
+    target_alias = args[0].lstrip("@")
+    try:
+        duration = int(args[-1])
+    except ValueError:
+        await update.effective_message.reply_text(
+            "Срок должен быть числом (в днях)."
+        )
+        await delete_command_message(update)
+        return
+    reason = " ".join(args[1:-1])
+    try:
+        target_user_id = int(target_alias)
+    except ValueError:
+        await update.effective_message.reply_text(
+            "Ошибка: для /warn необходимо указывать числовой user_id."
+        )
+        await delete_command_message(update)
+        return
+    try:
+        user_record = add_punishment(
+            target_user_id,
+            target_alias,
+            "warn",
+            reason,
+            duration,
+            update.effective_message.from_user.first_name,
+        )
+        await update.effective_message.reply_text(
+            f"Пользователю {target_alias} выдано предупреждение. Всего предупреждений: "
+            f"{user_record['warns']}."
+        )
+        log_text = (
+            f"ПРЕДУПРЕЖДЕНИЕ: Админ {update.effective_message.from_user.first_name} "
+            f"(ID: {update.effective_message.from_user.id}) выдал предупреждение пользователю "
+            f"{target_alias} на {duration} дней. Причина: {reason}. Всего предупреждений: "
+            f"{user_record['warns']}."
+        )
+        await context.bot.send_message(
+            chat_id=ADMIN_GROUP_ID,
+            message_thread_id=LOGS_THREAD_ID,
+            text=log_text,
+        )
+    except Exception as e:
+        await update.effective_message.reply_text(
+            "Ошибка при выполнении команды /warn."
+        )
+        logger.error("Ошибка в /warn: %s", e)
+    await delete_command_message(update)
+
+
+async def unwarn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /unwarn user_id
+    Снимает одно предупреждение с пользователя.
+    """
+    if not await is_valid_admin_command(update, context):
+        return
+    args = context.args
+    if len(args) < 1:
+        await update.effective_message.reply_text("Использование: /unwarn user_id")
+        await delete_command_message(update)
         return
 
-    # 3.6, 3.7. Использование мата и завуалированного мата
-    if BANNED_PATTERN.search(text):
-        await delete_and_reply(message, "Ваше сообщение удалено за использование ненормативной лексики.")
+    target_alias = args[0].lstrip("@")
+    try:
+        target_user_id = int(target_alias)
+    except ValueError:
+        await update.effective_message.reply_text(
+            "Ошибка: для /unwarn необходимо указывать числовой user_id."
+        )
+        await delete_command_message(update)
         return
-
-    # 3.8. Дискриминация и националистические высказывания
-    hate_keywords = ['нация', 'рас', 'евреи', 'черные', 'азиаты', 'национализм', 'супремаси']
-    if any(word in text for word in hate_keywords):
-        await delete_and_reply(message, "Ваше сообщение удалено за недопустимое содержание.")
-        return
-
-    # 3.10. Заявления о превосходстве (если выявлены, удаляем сообщение)
-    if SUPERIORITY_PATTERN.search(text):
-        await delete_and_reply(message, "Выражения превосходства над другими запрещены.")
-        return
-
-    # 3.13. Пропаганда насилия, оружия, наркотиков, порнографии и т.п.
-    if DRUG_VIOLENCE_PATTERN.search(text):
-        await delete_and_reply(message, "Пропаганда насилия, оружия, наркотиков или порнографического контента запрещена.")
-        return
-
-    # 3.14. Клевета и распространение ложной информации
-    if DEFAMATION_PATTERN.search(text):
-        await delete_and_reply(message, "Распространение ложной информации и клевета запрещены.")
-        return
-
-    # 3.15, 3.21. Угрозы, оскорбления и провокационные высказывания
-    threat_keywords = ['убью', 'смерть', 'угрожаю', 'накажу']
-    if any(word in text for word in threat_keywords):
-        await delete_and_reply(message, "Ваше сообщение удалено за угрозы или оскорбления.")
-        return
-
-    # 3.16. Флуд: повторяющиеся символы или слишком частые сообщения
-    if has_repeated_characters(text):
-        await delete_and_reply(message, "Ваше сообщение удалено за флуд (повторяющиеся символы).")
-        return
-
-    # 3.17. Спам, реклама и публикация ссылок
-    if contains_link(text):
-        await delete_and_reply(message, "Ваше сообщение удалено за публикацию ссылок/рекламу.")
-        return
-
-    # 3.18. Троллинг и провокационные сообщения
-    if TROLLING_PATTERN.search(text):
-        await delete_and_reply(message, "Троллинг и провокационные сообщения запрещены.")
-        return
-
-    # 3.19. Обсуждение действий модераторов/администрации
-    if (re.search(r'\b(модератор(ы)?|администрация)\b', text) and
-        re.search(r'\b(обсуждение|критику(?:ть)?|жалоба)\b', text)):
-        await delete_and_reply(message, "Обсуждение действий модераторов запрещено.")
-        return
-
-    # 3.20. Разглашение личной информации
-    if PERSONAL_INFO_PATTERN.search(text):
-        await delete_and_reply(message, "Разглашение личной информации запрещено.")
-        return
-
-    # 3.22. Попрошайничество
-    if re.search(r'\b(пожалуйста,? дайте|помогите мне,? пожалуйста)\b', text):
-        await delete_and_reply(message, "Попрошайничество запрещено.")
-        return
-
-    # 3.23. Нытьё и гнусавость
-    if re.search(r'\b(хныкать|ныть|жаловаться без причины)\b', text):
-        await delete_and_reply(message, "Нытьё в чате не приветствуется.")
-        return
-
-    # 4.1. Злоупотребление CAPS LOCK (если более 70% букв — заглавные)
-    letters = [c for c in text if c.isalpha()]
-    if letters:
-        uppercase_count = sum(1 for c in letters if c.isupper())
-        if len(letters) > 10 and (uppercase_count / len(letters)) > 0.7:
-            await delete_and_reply(message, "Злоупотребление CAPS LOCK запрещено.")
-            return
-
-    # 4.2. Избыточное использование emoji (если сообщение состоит только из emoji и их слишком много)
-    text_no_space = text_original.replace(" ", "")
-    emoji_pattern = re.compile(
-        "[\U0001F600-\U0001F64F"
-        "\U0001F300-\U0001F5FF"
-        "\U0001F680-\U0001F6FF"
-        "\U0001F1E0-\U0001F1FF]+", flags=re.UNICODE
-    )
-    if text_no_space and emoji_pattern.fullmatch(text_no_space):
-        count = context.user_data.get('emoji_count', 0) + 1
-        context.user_data['emoji_count'] = count
-        if count >= 5:
-            await delete_and_reply(message, "Избыточное использование emoji не приветствуется.")
-            context.user_data['emoji_count'] = 0
-            return
+    user_record = remove_warn(target_user_id)
+    if user_record is None:
+        await update.effective_message.reply_text("Нет предупреждений для снятия.")
     else:
-        context.user_data['emoji_count'] = 0
+        await update.effective_message.reply_text(
+            f"Предупреждение снято. Осталось предупреждений: {user_record['warns']}."
+        )
+        log_text = (
+            f"UNWARN: Админ {update.effective_message.from_user.first_name} "
+            f"(ID: {update.effective_message.from_user.id}) снял предупреждение с пользователя "
+            f"{target_alias}. Осталось предупреждений: {user_record['warns']}."
+        )
+        await context.bot.send_message(
+            chat_id=ADMIN_GROUP_ID,
+            message_thread_id=LOGS_THREAD_ID,
+            text=log_text,
+        )
+    await delete_command_message(update)
 
-    # 4.4. Разбиение сообщения на множество коротких слов
-    words = text.split()
-    if len(words) >= 5 and all(len(word) <= 2 for word in words):
-        await delete_and_reply(message, "Разбивание сообщения на отдельные слова недопустимо.")
+
+async def mute_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /mute user_id причина срок(в минутах)
+    Ограничивает возможность отправки сообщений в FRONTEND_CHAT_ID.
+    """
+    if not await is_valid_admin_command(update, context):
+        return
+    args = context.args
+    if len(args) < 3:
+        await update.effective_message.reply_text(
+            "Использование: /mute user_id причина срок(в минутах)"
+        )
+        await delete_command_message(update)
         return
 
-    # 4.5. Сообщения должны быть на русском языке (проверяем соотношение кириллицы)
-    total_letters = [c for c in text if c.isalpha()]
-    if total_letters:
-        cyrillic_count = sum(1 for c in total_letters if re.match(r'[А-Яа-яЁё]', c))
-        if (cyrillic_count / len(total_letters)) < 0.5:
-            await delete_and_reply(message, "Сообщения должны быть на русском языке.")
-            return
+    target_alias = args[0].lstrip("@")
+    try:
+        duration = int(args[-1])
+    except ValueError:
+        await update.effective_message.reply_text(
+            "Срок должен быть числом (в минутах)."
+        )
+        await delete_command_message(update)
+        return
+    reason = " ".join(args[1:-1])
+    try:
+        target_user_id = int(target_alias)
+    except ValueError:
+        await update.effective_message.reply_text(
+            "Ошибка: для /mute необходимо указывать числовой user_id."
+        )
+        await delete_command_message(update)
+        return
+    try:
+        until_date = datetime.now() + timedelta(minutes=duration)
+        permissions = ChatPermissions(can_send_messages=False)
+        await context.bot.restrict_chat_member(
+            chat_id=FRONTEND_CHAT_ID,
+            user_id=target_user_id,
+            permissions=permissions,
+            until_date=until_date,
+        )
+        user_record = add_punishment(
+            target_user_id,
+            target_alias,
+            "mute",
+            reason,
+            duration,
+            update.effective_message.from_user.first_name,
+        )
+        await update.effective_message.reply_text(
+            f"Пользователь {target_alias} замьючен на {duration} минут."
+        )
+        log_text = (
+            f"MUTE: Админ {update.effective_message.from_user.first_name} "
+            f"(ID: {update.effective_message.from_user.id}) замьючил пользователя "
+            f"{target_alias} на {duration} минут. Причина: {reason}."
+        )
+        await context.bot.send_message(
+            chat_id=ADMIN_GROUP_ID,
+            message_thread_id=LOGS_THREAD_ID,
+            text=log_text,
+        )
+    except Exception as e:
+        await update.effective_message.reply_text(
+            "Ошибка при выполнении команды /mute."
+        )
+        logger.error("Ошибка в /mute: %s", e)
+    await delete_command_message(update)
 
-    # Дополнительная проверка на спам (смешение алфавитов)
-    if any(keyword in text for keyword in SPAM_KEYWORDS) and is_mixed_alphabet_spam(text):
-        await delete_and_reply(message, "Сообщение удалено как спам.")
+
+async def unmute_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /unmute user_id
+    Снимает ограничения (unmute) с пользователя.
+    """
+    if not await is_valid_admin_command(update, context):
+        return
+    args = context.args
+    if len(args) < 1:
+        await update.effective_message.reply_text("Использование: /unmute user_id")
+        await delete_command_message(update)
         return
 
-    # Ограничение частоты сообщений: более 3 сообщений за 3 минуты
-    now = datetime.now()
-    message_times = context.user_data.get('message_times', [])
-    message_times = [t for t in message_times if now - t < timedelta(minutes=3)]
-    message_times.append(now)
-    context.user_data['message_times'] = message_times
-    if len(message_times) > 3:
-        await delete_and_reply(message, "Вы отправляете сообщения слишком часто. Пожалуйста, замедлитесь.")
-        context.user_data['message_times'] = []
+    target_alias = args[0].lstrip("@")
+    try:
+        target_user_id = int(target_alias)
+    except ValueError:
+        await update.effective_message.reply_text(
+            "Ошибка: для /unmute необходимо указывать числовой user_id."
+        )
+        await delete_command_message(update)
+        return
+    try:
+        permissions = ChatPermissions(can_send_messages=True)
+        await context.bot.restrict_chat_member(
+            chat_id=FRONTEND_CHAT_ID,
+            user_id=target_user_id,
+            permissions=permissions,
+        )
+        await update.effective_message.reply_text(
+            f"Ограничения сняты с пользователя {target_alias}."
+        )
+        log_text = (
+            f"UNMUTE: Админ {update.effective_message.from_user.first_name} "
+            f"(ID: {update.effective_message.from_user.id}) снял ограничения с пользователя "
+            f"{target_alias}."
+        )
+        await context.bot.send_message(
+            chat_id=ADMIN_GROUP_ID,
+            message_thread_id=LOGS_THREAD_ID,
+            text=log_text,
+        )
+    except Exception as e:
+        await update.effective_message.reply_text(
+            "Ошибка при выполнении команды /unmute."
+        )
+        logger.error("Ошибка в /unmute: %s", e)
+    await delete_command_message(update)
+
+
+async def rules_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Выводит правила чата.
+    Команда доступна только в личном чате.
+    """
+    if update.effective_chat.type != ChatType.PRIVATE:
+        await update.effective_message.reply_text(
+            "Команда /rules доступна только в личном чате со мной. "
+            "Пожалуйста, напишите мне в ЛС."
+        )
         return
 
-# ------------------------- Команды бота -------------------------
+    rules_file = "rules.txt"
+    if not os.path.exists(rules_file):
+        # Если файла нет, можно задать правила по умолчанию
+        default_rules = "Правила чата:\n1. Будьте вежливы.\n2. Не допускаются оскорбления.\n3. Соблюдайте тему."
+        await update.effective_message.reply_text(default_rules)
+        return
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Привет! Я бот-модератор чата. Соблюдайте правила:\n"
-        "- Ненормативная лексика, угрозы и оскорбления запрещены.\n"
-        "- Флуд, спам, ссылки и реклама не приветствуются.\n"
-        "- Обсуждение правил и действий модераторов запрещено.\n"
-        "Более подробные правила доступны у администратора."
+    try:
+        with open(rules_file, "r", encoding="utf-8") as f:
+            rules_text = f.read()
+        await update.effective_message.reply_text(rules_text)
+    except Exception as e:
+        await update.effective_message.reply_text("Не удалось загрузить правила.")
+        logger.error("Ошибка при чтении rules.txt: %s", e)
+
+
+async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Приветствие новых участников.
+    """
+    for member in update.effective_message.new_chat_members:
+        welcome_text = (
+            f"Добро пожаловать, {member.first_name}! "
+            "Ознакомьтесь с правилами чата."
+        )
+        await context.bot.send_message(
+            chat_id=update.effective_message.chat.id, text=welcome_text
+        )
+
+
+async def prevent_group_addition(
+        update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    """
+    Если бот добавлен в группу, он сообщает, что не предназначен для работы в группах,
+    и покидает её.
+    """
+    chat_member_update = update.my_chat_member
+    if not chat_member_update:
+        return
+    chat = chat_member_update.chat
+    new_status = chat_member_update.new_chat_member.status
+    if chat.type != ChatType.PRIVATE and new_status in ["member", "administrator"]:
+        await context.bot.send_message(
+            chat_id=chat.id,
+            text="Извините, я не предназначен для работы в группах."
+        )
+        await context.bot.leave_chat(chat.id)
+
+
+# ========= Основная функция =========
+async def main():
+    init_db_postgres()
+    cleanup_expired_warnings()
+
+    application = ApplicationBuilder().token(TOKEN).build()
+
+    # Регистрируем обработчики команд администрирования (работают в группе)
+    application.add_handler(
+        CommandHandler("ban", ban_command, filters=filters.ChatType.GROUP)
+    )
+    application.add_handler(
+        CommandHandler("warn", warn_command, filters=filters.ChatType.GROUP)
+    )
+    application.add_handler(
+        CommandHandler("unwarn", unwarn_command, filters=filters.ChatType.GROUP)
+    )
+    application.add_handler(
+        CommandHandler("mute", mute_command, filters=filters.ChatType.GROUP)
+    )
+    application.add_handler(
+        CommandHandler("unmute", unmute_command, filters=filters.ChatType.GROUP)
+    )
+    # Обработчик команды /rules (работает только в ЛС)
+    application.add_handler(CommandHandler("rules", rules_command))
+    # Обработчик обычных сообщений для автоматической проверки нарушений
+    application.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
+    )
+    # Приветствие новых участников
+    application.add_handler(
+        MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new_member)
+    )
+    # Обработчик изменения статуса бота (автоматическое покидание групп)
+    application.add_handler(
+        ChatMemberHandler(prevent_group_addition,
+                          ChatMemberHandler.MY_CHAT_MEMBER)
     )
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Список доступных команд:\n"
-        "/start — запуск бота\n"
-        "/rules — правила чата\n"
-        "/help — помощь"
-    )
+    # Используем последовательный запуск polling вместо run_polling, чтобы избежать ошибок с циклом событий
+    await application.initialize()
+    await on_startup(application)
+    await application.start_polling()
+    await application.updater.idle()
 
-async def rules(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    rules_text = (
-        "📚 Правила чата:\n\n"
-        "⚠️ 1. Условия действия правил чата\n"
-        "  1.1. Пользователи, заходя в чат, принимают на себя обязательства соблюдать правила.\n"
-        "  1.2. Незнание правил не освобождает от ответственности.\n\n"
-        "✅ 2. Разрешается общение, шутки, помощь и обмен информацией.\n\n"
-        "⛔ 3. Категорически запрещено:\n"
-        "  3.1. Обсуждение правил чата.\n"
-        "  3.2. Мошенничество, пиратство и использование запрещённых программ.\n"
-        "  3.3. Выдача себя за представителя администрации.\n"
-        "  3.4. Использование мата и завуалированной лексики.\n"
-        "  3.5. Дискриминация, национализм и разжигание ненависти.\n"
-        "  3.6. Флуд, спам, реклама и публикация ссылок.\n"
-        "  3.7. Троллинг, провокации и обсуждение действий модераторов.\n"
-        "  3.8. Разглашение личной информации.\n"
-        "  3.9. Угрозы, попрошайничество, нытьё и гнусавость.\n\n"
-        "⚠️ 4. Рекомендуется не злоупотреблять Caps Lock, смайлами, разбивать сообщения и использовать только русский язык (если нет необходимости).\n\n"
-        "✅ 5. Emoji допустимы для выражения эмоций, но их избыточное использование недопустимо."
-    )
-    await update.message.reply_text(rules_text)
 
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    logger.error(msg="Ошибка при обработке обновления", exc_info=context.error)
-
-# ------------------------- Основной запуск -------------------------
-
-def main():
-    application = Application.builder().token(TOKEN).build()
-
-    # Регистрируем обработчики для команд в групповых чатах
-    application.add_handler(CommandHandler("start", start, filters=filters.ChatType.GROUPS))
-    application.add_handler(CommandHandler("rules", rules, filters=filters.ChatType.GROUPS))
-    application.add_handler(CommandHandler("help", help_command, filters=filters.ChatType.GROUPS))
-    # Обработчик текстовых сообщений (исключая команды) с проверками правил
-    application.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND, check_message))
-    application.add_error_handler(error_handler)
-
-    application.run_polling()
-
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    asyncio.run(main())
